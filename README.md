@@ -78,7 +78,12 @@ options:
   -fa,       --flash-attn       [false ] 使用flash attention 解码
   -itn,      --use-itn          [false ] 使用逆文本正则化，包括标点。
   -prfix,    --use-prefix       [false ] 输出语种、情感、事件、是否itn
+  -otxt,     --output-txt       [false ] 将识别结果输出到文本文件（默认与输入同名，仅替换扩展名为 .txt；可用 -of 自定义）
+  -pp,       --print-progress   [false ] 打印处理进度（默认每 5% 在 stderr 输出一次）
+  -of FNAME, --output-file FNAME [     ] 输出文件路径（不含扩展名，配合 -otxt 使用）
  ```
+
+> 说明：`-otxt` 的输出为纯转写文本（每个 VAD 语音段一行，自动跳过 `<|zh|>`、`<|EMO_UNKNOWN|>` 等前缀标签）。输入为 `audio.wav` 时默认生成 `audio.txt`。
 #### 使用
 ```bash
 
@@ -91,6 +96,9 @@ cmake -DCMAKE_BUILD_TYPE=Release .. && make -j 8
 
 # -t means thread num， -t 指定线程数
 ./bin/sense-voice-main -m /path/gguf-fp16-sense-voice-small.bin /path/asr_example_zh.wav  -t 4 -ng
+
+# -otxt 将识别结果写入 asr_example_zh.txt，-pp 打印处理进度
+./bin/sense-voice-main -m /path/gguf-fp16-sense-voice-small.bin /path/asr_example_zh.wav  -t 4 -ng -otxt -pp
 ```
 
 ### 输出
@@ -149,6 +157,9 @@ main: decoder audio use 0.103725 s, rtf is 0.018700.
 ```
 ### 流式语音识别识别
 流式的vad是基于信号处理实现的，区别于非流式的vad是使用模型实现的
+
+除下方列出的参数外，`sense-voice-zcr-main`（流式 VAD + 批量识别）同样支持 `-otxt` / `--output-txt`（识别结果写入文本文件，扩展名替换为 `.txt`，可用 `-of` 自定义路径）和 `-pp` / `--print-progress`（按读取进度打印百分比）。
+
 ```bash
 usage: ./bin/sense-voice-stream [options]
 

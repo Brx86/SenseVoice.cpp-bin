@@ -53,6 +53,8 @@ struct sense_voice_params {
     float speech_prob_threshold = 0.1f;           // speech probability threshold
     bool debug_mode = false;
     bool no_prints = false;
+    bool output_txt = false;
+    bool print_progress = false;
     bool use_gpu = true;
     bool flash_attn = false;
     bool use_itn = false;
@@ -121,6 +123,8 @@ static void sense_voice_print_usage(int /*argc*/, char **argv, const sense_voice
     fprintf(stderr, "  -debug,    --debug-mode        [%-7s] enable debug mode (eg. dump log_mel)\n", params.debug_mode ? "true" : "false");
     fprintf(stderr, "  -of FNAME, --output-file FNAME [%-7s] output file path (without file extension)\n", "");
     fprintf(stderr, "  -np,       --no-prints         [%-7s] do not print anything other than the results\n", params.no_prints ? "true" : "false");
+    fprintf(stderr, "  -otxt,     --output-txt        [%-7s] output result in a text file\n", params.output_txt ? "true" : "false");
+    fprintf(stderr, "  -pp,       --print-progress    [%-7s] print progress\n", params.print_progress ? "true" : "false");
     fprintf(stderr, "  -l LANG,   --language LANG     [%-7s] spoken language ('auto' for auto-detect), support [`zh`, `en`, `yue`, `ja`, `ko`\n", params.language.c_str());
     fprintf(stderr, "             --use-prefix        [%-7s] use sense voice prefix\n", params.use_prefix ? "true" : "false");
     fprintf(stderr, "             --prompt PROMPT     [%-7s] initial prompt (max n_text_ctx/2 tokens)\n", params.prompt.c_str());
@@ -192,6 +196,10 @@ static bool sense_voice_params_parse(int argc, char **argv, sense_voice_params &
             params.fname_out.emplace_back(argv[++i]);
         } else if (arg == "-np" || arg == "--no-prints") {
             params.no_prints = true;
+        } else if (arg == "-otxt" || arg == "--output-txt") {
+            params.output_txt = true;
+        } else if (arg == "-pp" || arg == "--print-progress") {
+            params.print_progress = true;
         } else if (arg == "-l" || arg == "--language") {
             params.language = sense_voice_param_turn_lowercase(argv[++i]);
         } else if (arg == "--prompt") {
@@ -240,13 +248,44 @@ static bool is_file_exist(const char *fileName) {
 }
 
 // 函数声明
-void sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const sense_voice_params &params, 
-                                         std::ifstream &file, const WaveHeader &header);
-void sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voice_params &params,
-                               std::vector<sense_voice_segment> &batch);
+std::string sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const sense_voice_params &params, 
+                                         std::ifstream &file, const WaveHeader &header, int64_t total_samples,
+                                         int *progress_prev);
+std::string sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voice_params &params,
+                               std::vector<sense_voice_segment> &batch, std::string &txt_output);
 bool check_and_process_batch_if_full(struct sense_voice_context *ctx, const sense_voice_params &params,
                                      std::vector<sense_voice_segment> &current_batch, size_t &current_batch_size,
-                                     size_t new_segment_size, size_t batch_samples);
+                                     size_t new_segment_size, size_t batch_samples, std::string &txt_output);
+
+// 依 whisper.cpp：按 progress_step（%）在 stderr 上打印处理进度
+static void sense_voice_print_progress(int64_t processed_samples, int64_t total_samples,
+                                       int progress_step, int *progress_prev) {
+    if (total_samples <= 0 || progress_prev == nullptr) {
+        return;
+    }
+    int progress = (int) (100.0 * processed_samples / total_samples + 0.5);
+    if (progress >= *progress_prev + progress_step) {
+        *progress_prev += progress_step;
+        fprintf(stderr, "%s: progress = %3d%%\n", __func__, progress);
+    }
+}
+
+// 将一批识别结果拼接为纯文本（whisper.cpp 的 -otxt 风格：一行一段，
+// 始终跳过开头的语言/情感/事件等 4 个前缀 token，输出干净文本）
+static void append_batch_text_to_txt(const struct sense_voice_context *ctx, const sense_voice_params &params,
+                                     std::string &txt_output) {
+    GGML_UNUSED(params);
+    for (size_t i = 0; i < ctx->state->segmentIDs.size(); i++) {
+        const sense_voice_segment &result = ctx->state->result_all[ctx->state->segmentIDs[i]];
+        for (size_t j = 4; j < result.tokens.size(); j++) {
+            const int id = result.tokens[j];
+            if (!id || (j > 4 && result.tokens[j - 1] == id))
+                continue;
+            txt_output += ctx->vocab.id_to_token.at(id);
+        }
+        txt_output += "\n";
+    }
+}
 
 /**
  * This the arbitrary data which will be passed to each callback.
@@ -345,8 +384,9 @@ void sense_voice_free(struct sense_voice_context *ctx) {
 }
 
 // 流式音频处理：从ifstream逐块读取并处理
-void sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const sense_voice_params &params, 
-                                         std::ifstream &file, const WaveHeader &header) {
+std::string sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const sense_voice_params &params, 
+                                         std::ifstream &file, const WaveHeader &header, int64_t total_samples,
+                                         int *progress_prev) {
     const int n_sample_step = params.chunk_size * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
     const int keep_nomute_step = params.chunk_size * params.min_mute_chunks * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
     const int max_nomute_step = params.chunk_size * params.max_nomute_chunks * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
@@ -360,13 +400,20 @@ void sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const
     // 流式读取缓冲区
     std::vector<float> audio_buffer;
     std::vector<float> chunk_data;
+    std::string txt_output;                       // -otxt: 收集识别文本
     const size_t chunk_samples = n_sample_step;
     int processed_samples = 0;
 
     // 逐块读取音频数据
+    int64_t samples_read = 0; // 已读取的样本总数（用于 -pp 进度）
     while (read_audio_chunk(file, chunk_data, chunk_samples)) {
         // 将新数据追加到缓冲区
         audio_buffer.insert(audio_buffer.end(), chunk_data.begin(), chunk_data.end());
+
+        if (params.print_progress) {
+            samples_read += (int64_t) chunk_data.size();
+            sense_voice_print_progress(samples_read, total_samples, params.progress_step, progress_prev);
+        }
         
         // 处理缓冲区中的完整chunks
         while (audio_buffer.size() >= processed_samples + n_sample_step) {
@@ -407,7 +454,7 @@ void sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const
 
                 size_t segment_size = segment.samples.size();
                 check_and_process_batch_if_full(ctx, params, current_batch, current_batch_size, 
-                                              segment_size, batch_samples);
+                                              segment_size, batch_samples, txt_output);
                 
                 current_batch.push_back(segment);
                 current_batch_size += segment_size;
@@ -434,7 +481,7 @@ void sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const
 
                     size_t segment_size = segment.samples.size();
                     check_and_process_batch_if_full(ctx, params, current_batch, current_batch_size, 
-                                                  segment_size, batch_samples);
+                                                  segment_size, batch_samples, txt_output);
                     
                     current_batch.push_back(segment);
                     current_batch_size += segment_size;
@@ -475,20 +522,22 @@ void sense_voice_process_stream_from_file(struct sense_voice_context *ctx, const
 
         size_t segment_size = segment.samples.size();
         check_and_process_batch_if_full(ctx, params, current_batch, current_batch_size, 
-                                      segment_size, batch_samples);
+                                      segment_size, batch_samples, txt_output);
         
         current_batch.push_back(segment);
     }
 
     // 处理最后的batch
     if (!current_batch.empty()) {
-        sense_voice_process_batch(ctx, params, current_batch);
+        sense_voice_process_batch(ctx, params, current_batch, txt_output);
     }
+
+    return txt_output;
 }
 
-// 处理一个batch并清理计算图缓冲区
-void sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voice_params &params,
-                               std::vector<sense_voice_segment> &batch) {
+// 处理一个batch并清理计算图缓冲区，同时收集 -otxt 所需文本
+std::string sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voice_params &params,
+                                      std::vector<sense_voice_segment> &batch, std::string &txt_output) {
     // 清理之前的结果
     ctx->state->result_all.clear();
     ctx->state->segmentIDs.clear();
@@ -508,21 +557,26 @@ void sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voic
     sense_voice_batch_full(ctx, wparams);
     sense_voice_batch_print_output(ctx, params.use_prefix, params.use_itn);
 
+    // 收集纯文本结果（供 -otxt 写文件）
+    append_batch_text_to_txt(ctx, params, txt_output);
+
     // 清理处理后的结果以释放内存
     ctx->state->result_all.clear();
     ctx->state->segmentIDs.clear();
+
+    return txt_output;
 }
 
 // 检查batch是否满载，如果满载则处理并清空
 bool check_and_process_batch_if_full(struct sense_voice_context *ctx, const sense_voice_params &params,
                                      std::vector<sense_voice_segment> &current_batch, size_t &current_batch_size,
-                                     size_t new_segment_size, size_t batch_samples) {
+                                     size_t new_segment_size, size_t batch_samples, std::string &txt_output) {
     if (!current_batch.empty() && 
         (current_batch_size + new_segment_size > batch_samples || 
          current_batch.size() >= params.max_batch)) {
         
         // 处理当前batch
-        sense_voice_process_batch(ctx, params, current_batch);
+        sense_voice_process_batch(ctx, params, current_batch, txt_output);
         
         // 清空batch准备下一轮
         current_batch.clear();
@@ -616,6 +670,8 @@ int main(int argc, char **argv) {
     ggml_set_zero(ctx->state->vad_lstm_context);
     ggml_set_zero(ctx->state->vad_lstm_hidden_state);
 
+    std::string txt_result; // 当前文件的识别文本（-otxt）
+
     for (int f = 0; f < (int) params.fname_inp.size(); ++f) {
         const auto fname_inp = params.fname_inp[f];
         const auto fname_out = f < (int) params.fname_out.size() && !params.fname_out[f].empty() ? params.fname_out[f] : params.fname_inp[f];
@@ -660,12 +716,41 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n");
         }
 
+        // 依 whisper.cpp：-otxt 输出路径优先取 -of，否则用输入文件名（去扩展名）+ ".txt"
+        std::string fname_txt;
+        if (params.output_txt) {
+            if (f < (int) params.fname_out.size() && !params.fname_out[f].empty()) {
+                fname_txt = params.fname_out[f];
+                const size_t dot = fname_txt.find_last_of('.');
+                if (dot != std::string::npos && dot > fname_txt.find_last_of('/')) {
+                    fname_txt.resize(dot);
+                }
+            } else {
+                fname_txt = fname_inp.substr(0, fname_inp.find_last_of('.'));
+            }
+            fname_txt += ".txt";
+        }
+
+        int progress_prev = 0;
+
         {
             // 使用流式处理音频
-            sense_voice_process_stream_from_file(ctx, params, file, header);
+            txt_result = sense_voice_process_stream_from_file(ctx, params, file, header,
+                                                              (int64_t) total_samples, &progress_prev);
         }
-        
+
         file.close();
+
+        // -otxt: 将识别结果写入文本文件
+        if (params.output_txt) {
+            std::ofstream fout(fname_txt.c_str());
+            if (!fout) {
+                fprintf(stderr, "error: failed to open '%s' for writing\n", fname_txt.c_str());
+            } else {
+                fout << txt_result;
+                fprintf(stderr, "%s: saving output to '%s'\n", __func__, fname_txt.c_str());
+            }
+        }
     }
     sense_voice_free(ctx);
     return 0;

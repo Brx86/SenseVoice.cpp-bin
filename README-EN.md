@@ -83,6 +83,9 @@ options:
   -fa,       --flash-attn       [false ] Enable flash attention decoding
   -itn,      --use-itn          [false ] Use inverse text normalization (includes punctuation)
   -prfix,    --use-prefix       [false ] Output extra info: language, emotion, event, itn
+  -otxt,     --output-txt       [false ] Write the transcription to a text file (defaults to the input name with its extension replaced by .txt; use -of to customize)
+  -pp,       --print-progress   [false ] Print processing progress (every 5% by default, on stderr)
+  -of FNAME, --output-file FNAME [      ] Output file path (without extension, used with -otxt)
 ```
 
 ```bash
@@ -96,7 +99,12 @@ cmake -DCMAKE_BUILD_TYPE=Release .. && make -j 8
 
 # -t means thread num
 ./bin/sense-voice-main -m /path/gguf-fp16-sense-voice-small.bin /path/asr_example_zh.wav  -t 4 -ng
+
+# -otxt writes the transcription to asr_example_zh.txt, -pp prints the processing progress
+./bin/sense-voice-main -m /path/gguf-fp16-sense-voice-small.bin /path/asr_example_zh.wav  -t 4 -ng -otxt -pp
 ```
+
+> Note: `-otxt` writes plain transcription text (one line per VAD speech segment, skipping the `<|zh|>`, `<|EMO_UNKNOWN|>` and other prefix tokens). For an input named `audio.wav` the output is `audio.txt` by default.
 
 ### Output
 
@@ -160,6 +168,9 @@ main: decoder audio use 0.135743 s, rtf is 0.018916.
 sudo apt install libsdl2-dev
 ./bin/sense-voice-stream -m /path/gguf-fp16-sense-voice-small.bin
 ```
+
+The `sense-voice-zcr-main` example (streaming VAD + batch recognition) also supports `-otxt` / `--output-txt` (write the transcription to a text file with the extension replaced by `.txt`; `-of` sets a custom path) and `-pp` / `--print-progress` (print a percentage as the file is read).
+
 ## Acknowledgements
 
 1.	This project borrows and mimics most of the C++ code from [whisper.cpp](https://github.com/ggerganov/ggml/blob/master/examples/whisper/whisper.cpp).

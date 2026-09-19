@@ -6,6 +6,8 @@
 #include "silero-vad.h"
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <string>
 #include <thread>
 
 #if defined(_MSC_VER)
@@ -281,6 +283,35 @@ static bool is_file_exist(const char *fileName)
     return infile.good();
 }
 
+// 依 whisper.cpp：按 progress_step（%）在 stderr 上打印处理进度
+static void sense_voice_print_progress(size_t processed_samples, size_t total_samples,
+                                       int progress_step, int * progress_prev) {
+    if (total_samples == 0 || progress_prev == nullptr) {
+        return;
+    }
+    int progress = (int) (100.0 * processed_samples / total_samples + 0.5);
+    if (progress >= *progress_prev + progress_step) {
+        *progress_prev += progress_step;
+        fprintf(stderr, "%s: progress = %3d%%\n", __func__, progress);
+    }
+}
+
+// 将当前识别结果的纯文本追加到 txt_output（-otxt 用，一行一段，
+// 始终跳过开头的语言/情感/事件等 4 个前缀 token，输出干净文本）
+static void sense_voice_append_result_to_txt(struct sense_voice_context * ctx,
+                                             std::string & txt_output) {
+    const auto & ids = ctx->state->ids;
+    for (size_t i = 4; i < ids.size(); i++) {
+        const int id = ids[i];
+        if (i > 4 && ids[i - 1] == id)
+            continue;
+        if (id) {
+            txt_output += ctx->vocab.id_to_token.at(id);
+        }
+    }
+    txt_output += "\n";
+}
+
 /**
  * This the arbitrary data which will be passed to each callback.
  * Later on we can for example add operation or tensor name filter from the CLI arg, or a file descriptor to dump the tensor.
@@ -475,6 +506,8 @@ int main(int argc, char ** argv) {
         const auto fname_out = f < (int) params.fname_out.size() && !params.fname_out[f].empty() ? params.fname_out[f] : params.fname_inp[f];
 
         std::vector<double> pcmf32;               // mono-channel F32 PCM
+        std::string txt_output;                   // -otxt: 收集识别文本
+        int progress_prev = 0;                    // -pp: 上次打印的进度
 
         int sample_rate;
         if (!::load_wav_file(fname_inp.c_str(), &sample_rate, pcmf32)) {
@@ -560,6 +593,10 @@ int main(int argc, char ** argv) {
             std::vector<double> speech_segment;
             for (int i = 0; i < pcmf32.size(); i += CHUNK_SIZE){
 
+                if (params.print_progress) {
+                    sense_voice_print_progress(i, pcmf32.size(), params.progress_step, &progress_prev);
+                }
+
                 n_pad = CHUNK_SIZE <= pcmf32.size() - i ? 0 : CHUNK_SIZE + i  - pcmf32.size();
 
                 for (int j = i + offset; j < i + CHUNK_SIZE; j++) {
@@ -591,6 +628,9 @@ int main(int argc, char ** argv) {
                                 return 10;
                             }
                             sense_voice_print_output(ctx, params.use_prefix, params.use_itn, false);
+                            if (params.output_txt) {
+                                sense_voice_append_result_to_txt(ctx, txt_output);
+                            }
                             current_speech_end = current_speech_start = 0;
                             if (next_start < prev_end) {
                                 triggered = false;
@@ -640,6 +680,9 @@ int main(int argc, char ** argv) {
                                     return 10;
                                 }
                                 sense_voice_print_output(ctx, params.use_prefix, params.use_itn, false);
+                                if (params.output_txt) {
+                                    sense_voice_append_result_to_txt(ctx, txt_output);
+                                }
                                 current_speech_end = current_speech_start = 0;
                             }
                             prev_end = next_start = 0;
@@ -664,12 +707,33 @@ int main(int argc, char ** argv) {
                     return 10;
                 }
                 sense_voice_print_output(ctx, true, params.use_prefix, false);
+                if (params.output_txt) {
+                    sense_voice_append_result_to_txt(ctx, txt_output);
+                }
             }
         }
         SENSE_VOICE_LOG_INFO("\n%s: decoder audio use %f s, rtf is %f. \n\n",
                               __func__,
                               (ctx->state->t_encode_us + ctx->state->t_decode_us) / 1e6,
                               (ctx->state->t_encode_us + ctx->state->t_decode_us) / (1e6 * ctx->state->duration));
+
+        // -otxt: 将识别结果写入文本文件（优先 -of，否则输入文件名 + ".txt"）
+        if (params.output_txt) {
+            std::string fname_txt = fname_out;
+            const size_t dot = fname_txt.find_last_of('.');
+            if (dot != std::string::npos && dot > fname_txt.find_last_of('/')) {
+                fname_txt.resize(dot);
+            }
+            fname_txt += ".txt";
+
+            std::ofstream fout(fname_txt.c_str());
+            if (!fout) {
+                fprintf(stderr, "error: failed to open '%s' for writing\n", fname_txt.c_str());
+            } else {
+                fout << txt_output;
+                fprintf(stderr, "%s: saving output to '%s'\n", __func__, fname_txt.c_str());
+            }
+        }
 
     }
     sense_voice_free(ctx);
