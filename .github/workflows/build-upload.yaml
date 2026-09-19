@@ -1,0 +1,120 @@
+name: Build & Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '选择构建目标 (Select Build Target)'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'linux'
+          - 'windows'
+
+jobs:
+  # ==========================================
+  # 1. Linux (Ubuntu 22.04, amd64, GCC, Release)
+  # ==========================================
+  ubuntu-x64-gcc:
+    if: inputs.target == 'all' || inputs.target == 'linux'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libsdl2-dev cmake git
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH="\$ORIGIN"
+
+      - name: Build
+        run: |
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Run Tests
+        run: |
+          cd build
+          ctest -L gh --output-on-failure
+
+      - name: Prepare Artifact Package
+        run: |
+          mkdir -p dist
+          find build -type f -name "sense-voice-*" -executable -exec cp {} dist/ \;
+          find build -type f -name "*.so*" -exec cp -d {} dist/ \;
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sense-voice-linux-amd64
+          path: dist/
+          if-no-files-found: error
+
+  # ==========================================
+  # 2. Windows (x64, MSVC, CUDA 12.8.0)
+  # ==========================================
+  windows-x64-cublas:
+    if: inputs.target == 'all' || inputs.target == 'windows'
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install CUDA Toolkit 12.8.0
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@master
+        with:
+          cuda: '12.8.0'
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DGGML_CUDA=ON
+
+      - name: Build
+        run: |
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Copy CUDA Runtime DLLs
+        shell: pwsh
+        run: |
+          $cudaBin = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/bin"
+          $targetDir = "build/bin/Release"
+
+          if (-not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Force -Path $targetDir
+          }
+
+          Copy-Item -Path "$cudaBin/cudart64_*.dll" -Destination $targetDir -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "$cudaBin/cublas64_*.dll" -Destination $targetDir -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "$cudaBin/cublasLt64_*.dll" -Destination $targetDir -Force -ErrorAction SilentlyContinue
+
+      - name: Upload Windows CUDA Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sense-voice-windows-x64-cuda12.8.0
+          path: |
+            build/bin/Release/
+            build/**/*.dll
+          if-no-files-found: warn
